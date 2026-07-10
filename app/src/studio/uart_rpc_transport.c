@@ -136,6 +136,17 @@ static void serial_cb(const struct device *dev, void *user_data) {
             int sent = uart_fifo_fill(uart_dev, buf, claim_len);
 
             ring_buf_get_finish(tx_buf, MAX(sent, 0));
+
+            if (sent <= 0) {
+                /* The transport cannot take more right now (e.g. CDC-ACM's
+                 * internal TX buffer is full). On USB the drain that frees it
+                 * runs on this same system work queue, so looping here until
+                 * the ring empties deadlocks the whole queue (frozen sysworkq,
+                 * watchdog reset) for any response larger than that buffer.
+                 * Back off; the next tx-ready callback resumes the drain.
+                 */
+                break;
+            }
         }
     }
 }
