@@ -339,6 +339,37 @@ static int zmk_rpc_init(void) {
 
 SYS_INIT(zmk_rpc_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 
+/* Notifications are raised synchronously on whatever thread raised the event
+ * — often the system work queue, which is also where the USB transport drain
+ * runs. Never block there: if the transport mutex is held (a response is
+ * streaming) or the TX ring cannot hold the whole message, drop the
+ * notification instead of deadlocking the work queue. Clients treat
+ * notifications as best-effort state hints and resync on demand.
+ */
+static int send_notification(const zmk_studio_Response *resp) {
+    if (k_mutex_lock(&rpc_transport_mutex, K_NO_WAIT) != 0) {
+        LOG_WRN("Dropping studio notification: transport busy");
+        return -EBUSY;
+    }
+
+    int ret = 0;
+    size_t encoded_size = 0;
+    /* Worst case every payload byte is escaped by the framing layer, plus
+     * SOF/EOF. */
+    if (!pb_get_encoded_size(&encoded_size, &zmk_studio_Response_msg, resp) ||
+        ring_buf_space_get(&rpc_tx_buf) < (encoded_size * 2) + 2) {
+        LOG_WRN("Dropping studio notification: TX buffer full");
+        ret = -ENOSPC;
+    } else {
+        /* k_mutex is recursive for the owning thread, and the space check
+         * above guarantees the writer never waits for the ring to drain. */
+        ret = send_response(resp);
+    }
+
+    k_mutex_unlock(&rpc_transport_mutex);
+    return ret;
+}
+
 static int studio_rpc_listener_cb(const zmk_event_t *eh) {
     struct zmk_endpoint_changed *ep_changed = as_zmk_endpoint_changed(eh);
     if (ep_changed) {
@@ -351,7 +382,7 @@ static int studio_rpc_listener_cb(const zmk_event_t *eh) {
         zmk_studio_Response resp = zmk_studio_Response_init_zero;
         resp.which_type = zmk_studio_Response_notification_tag;
         resp.type.notification = rpc_notify->notification;
-        send_response(&resp);
+        send_notification(&resp);
         return ZMK_EV_EVENT_BUBBLE;
     }
 
